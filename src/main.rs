@@ -1,43 +1,70 @@
-use async_std::{io::BufReader, net::TcpStream};
 use async_std::{
+    io::BufReader,
+    net::TcpStream,
     net::{TcpListener, ToSocketAddrs},
     prelude::*,
     task,
 };
-use futures::channel::mpsc;
-use futures::sink::SinkExt;
-use std::collections::btree_map::Entry;
-use std::collections::HashMap;
-use std::sync::Arc;
+use futures::{channel::mpsc, sink::SinkExt};
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    sync::Arc,
+};
 
 fn main() -> Result<()> {
-    let fut = accept_loop("127.0.0.1:8000");
-    task::block_on(fut)
+    run()
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type Sender<T> = mpsc::UnboundedSender<T>;
+type Receiver<T> = mpsc::UnboundedReceiver<T>;
+
+fn run() -> Result<()> {
+    task::block_on(accept_loop("127.0.0.1:8000"))
+}
+
+fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    task::spawn(async move {
+        if let Err(err) = fut.await {
+            eprintln!("{}", err)
+        }
+    })
+}
 
 async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+
+    let (broker_sender, broker_receiver) = mpsc::unbounded();
+    let _broker_handle = task::spawn(broker_loop(broker_receiver));
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         let stream = stream?;
         println!("Accepting from {}", stream.peer_addr()?);
-        let _handle = task::spawn(connection_loop(stream));
+        spawn_and_log_error(connection_loop(broker_sender.clone(), stream));
     }
 
     Ok(())
 }
 
-async fn connection_loop(stream: TcpStream) -> Result<()> {
-    let reader = BufReader::new(&stream);
+async fn connection_loop(mut broker: Sender<Event>, stream: TcpStream) -> Result<()> {
+    let stream = Arc::new(stream);
+    let reader = BufReader::new(&*stream);
     let mut lines = reader.lines();
 
     let name = match lines.next().await {
         Some(line) => line?,
         None => Err("peer disconnected immediately")?,
     };
-    println!("name: {}", name);
+    broker
+        .send(Event::NewPeer {
+            name: name.clone(),
+            stream: Arc::clone(&stream),
+        })
+        .await
+        .unwrap();
 
     while let Some(line) = lines.next().await {
         let line = line?;
@@ -46,18 +73,24 @@ async fn connection_loop(stream: TcpStream) -> Result<()> {
             None => continue,
         };
 
-        let _dest: Vec<String> = dest
+        let dest: Vec<String> = dest
             .split(',')
             .map(|name| name.trim().to_string())
             .collect();
-        let _msg: String = msg.to_string();
+        let msg: String = msg.to_string();
+
+        broker
+            .send(Event::Message {
+                from: name.clone(),
+                to: dest,
+                msg,
+            })
+            .await
+            .unwrap();
     }
 
     Ok(())
 }
-
-type Sender<T> = mpsc::UnboundedSender<T>;
-type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
 async fn connection_writer_loop(
     mut messages: Receiver<String>,
